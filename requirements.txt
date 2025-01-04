@@ -1,0 +1,17 @@
+# Requirements for Race Car Ground Station
+
+# Core Dependencies
+PyQt5>=5.15.0
+pyqtgraph>=0.12.0
+numpy>=1.19.0
+pyserial>=3.5
+
+# Optional but recommended for better performance
+numba>=0.53.0  # For performance optimizations
+pyqtgraph-extensions>=0.0.2  # Additional PyQtGraph features
+
+# Development Dependencies
+pytest>=6.0.0  # For running tests
+black>=21.5b2  # For code formatting
+pylint>=2.8.0  # For code linting
+mypy>=0.910  # For type checking
