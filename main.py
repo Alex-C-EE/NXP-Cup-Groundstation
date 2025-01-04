@@ -187,29 +187,37 @@ class ApplicationManager:
             return 1
 
     def cleanup(self):
-        """
-        Clean up resources and perform an orderly shutdown.
-        This method ensures all components are properly closed and data is saved.
-        """
+        """Clean up resources and perform orderly shutdown."""
         self.logger.info("Starting application cleanup...")
         
         try:
-            # Stop data collection
+            # Stop data collection first
             if self.data_handler:
                 self.logger.debug("Stopping data handler...")
                 self.data_handler.stop()
+                # Give threads time to stop
+                QThread.msleep(100)
             
             # Save configuration
             if self.config:
                 self.logger.debug("Saving configuration...")
                 self.config.save_config()
             
-            # Clean up any remaining threads
+            # Clean up remaining threads
             for thread in self.threads:
                 if thread.isRunning():
                     self.logger.debug(f"Stopping thread: {thread.objectName()}")
                     thread.quit()
-                    thread.wait()
+                    # Wait with timeout
+                    if not thread.wait(1000):  # 1 second timeout
+                        self.logger.warning(f"Thread {thread.objectName()} did not stop gracefully")
+                        thread.terminate()
+            
+            # Clean up main window explicitly
+            if self.main_window:
+                self.logger.debug("Cleaning up main window...")
+                # This will trigger the closeEvent handler
+                self.main_window.close()
             
             self.logger.info("Cleanup completed successfully")
             

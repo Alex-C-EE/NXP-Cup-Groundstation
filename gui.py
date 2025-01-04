@@ -23,6 +23,7 @@ import time
 from visualisation_core import PlotManager, BasePlotWidget, LivePlotWidget
 from track_visualizer import TrackVisualizer as TrackVisualizerCore
 from visualisation_core import TrackVisualizer as TrackVisualizerWidget
+import logging
 
 class ClickableLabel(QLabel):
     """Label that emits a signal when clicked, useful for interactive data displays"""
@@ -294,6 +295,7 @@ class RaceViewTab(TabWidget):
             # Convert points to numpy arrays for plotting
             if self.path_points:
                 points = np.array(self.path_points)
+                self.logger.debug(f"Updating path plot with {len(points)} points")
                 self.path_curve.setData(
                     x=points[:, 0].astype(np.float32),
                     y=points[:, 1].astype(np.float32)
@@ -304,17 +306,6 @@ class RaceViewTab(TabWidget):
                 x=[sensor_data.position_x],
                 y=[sensor_data.position_y]
             )
-
-            # Update camera visualizations
-            if hasattr(sensor_data, 'camera_left') and sensor_data.camera_left:
-                left_data = np.array(sensor_data.camera_left.raw_data, dtype=np.float32)
-                x_data = np.arange(len(left_data), dtype=np.float32)
-                self.camera_left_curve.setData(x=x_data, y=left_data)
-
-            if hasattr(sensor_data, 'camera_right') and sensor_data.camera_right:
-                right_data = np.array(sensor_data.camera_right.raw_data, dtype=np.float32)
-                x_data = np.arange(len(right_data), dtype=np.float32)
-                self.camera_right_curve.setData(x=x_data, y=right_data)
 
             # Update dynamics plots
             current_time = np.array([sensor_data.timestamp], dtype=np.float32)
@@ -331,8 +322,11 @@ class RaceViewTab(TabWidget):
                 y=np.array([sensor_data.steering_angle], dtype=np.float32)
             )
 
+            if self.playback_index % 100 == 0:
+                self.logger.debug(f"Display updated: Speed={sensor_data.speed:.2f}, Position=({sensor_data.position_x:.2f}, {sensor_data.position_y:.2f})")
+
         except Exception as e:
-            print(f"Error updating display: {str(e)}")
+            self.logger.error(f"Error updating display: {str(e)}", exc_info=True)
             
     def _update_dynamics_plots(self, sensor_data):
         """Update vehicle dynamics plots"""
@@ -837,25 +831,21 @@ class DebugConsoleTab(TabWidget):
         scrollbar.setValue(scrollbar.maximum())
 
 class MainWindow(QMainWindow):
-    """Main application window with improved plot management"""
-    
     def __init__(self, config_manager, data_handler=None, track_visualizer=None):
-        """Initialize the main window with all necessary components.
-
-        Args:
-            config_manager: The configuration manager instance
-            data_handler: The data handler instance for processing telemetry
-            track_visualizer: The track visualization component
-        """
+        """Initialize the main window with all necessary components."""
         super().__init__()
+        
+        # Set up logging first
+        self.logger = logging.getLogger('race_ground_station.gui')
+        self.logger.debug("Initializing MainWindow")
+        
+        # Store configuration and components
         self.config = config_manager
-        
-        # Initialize plot manager first
-        self.plot_manager = PlotManager(self)
-        
-        # Store components
         self.data_handler = data_handler
         self.track_visualizer = track_visualizer
+        
+        # Initialize plot manager
+        self.plot_manager = PlotManager(self)
         
         # Initialize UI
         self.setup_window()
@@ -866,8 +856,10 @@ class MainWindow(QMainWindow):
         # Initialize timers
         self.setup_timers()
         
-        # Connect signals
+        # Connect signals LAST after everything is set up
         self.connect_signals()
+        
+        self.logger.debug("MainWindow initialization complete")
 
     def create_tabs(self):
         """Create application tabs with new plotting widgets"""
@@ -898,49 +890,72 @@ class MainWindow(QMainWindow):
         self.data_handler.error_occurred.connect(self.handle_error)
         self.data_handler.connection_status.connect(self.update_connection_status)
         self.data_handler.playback_finished.connect(self.handle_playback_finished)
-        
+
         # Plot manager signals
         self.plot_manager.error_occurred.connect(self.handle_error)
 
+        # Track visualizer signals
+        if self.track_visualizer:
+            self.track_visualizer.error_occurred.connect(self.handle_error)
+
+        self.logger.debug("Signal connections established")
+
     def closeEvent(self, event):
-        """Handle application shutdown"""
+        """Handle application shutdown with proper thread cleanup"""
+        self.logger.debug("Starting MainWindow cleanup")
         try:
-            # Stop all timers
+            # Stop all timers first
             if hasattr(self, 'update_timer'):
+                self.logger.debug("Stopping update timer")
                 self.update_timer.stop()
             if hasattr(self, 'status_timer'):
+                self.logger.debug("Stopping status timer")
                 self.status_timer.stop()
             
-            # Stop data handler
+            # Stop data handler and wait for threads
             if hasattr(self, 'data_handler'):
+                self.logger.debug("Stopping data handler")
                 self.data_handler.stop()
+                # Give threads time to stop
+                QThread.msleep(100)
             
             # Clean up plot manager
             if hasattr(self, 'plot_manager'):
+                self.logger.debug("Cleaning up plot manager")
                 self.plot_manager.cleanup()
             
             # Clean up tab widgets
-            for tab in self.tabs.values():
-                if hasattr(tab, 'cleanup'):
-                    tab.cleanup()
+            if hasattr(self, 'tabs'):
+                self.logger.debug("Cleaning up tabs")
+                for tab in self.tabs.values():
+                    if hasattr(tab, 'cleanup'):
+                        tab.cleanup()
             
             # Save configuration
+            self.logger.debug("Saving configuration")
             self.config.save_config()
             
-        except Exception as e:
-            print(f"Error during cleanup: {str(e)}")
-        finally:
+            self.logger.info("MainWindow cleanup completed successfully")
             event.accept()
+            
+        except Exception as e:
+            self.logger.error(f"Error during cleanup: {str(e)}")
+            event.accept()  # Accept anyway to ensure application can close
+
 
     def handle_new_data(self, sensor_data):
         """Process new sensor data updates"""
         try:
-            # Update status bar
+            # Update all active tabs
+            if hasattr(self, 'tabs'):
+                # Update current tab
+                current_tab = self.tab_widget.currentWidget()
+                if hasattr(current_tab, 'update_display'):
+                    current_tab.update_display(sensor_data)
+
+            # Update status bar with latest data
             self.update_status_bar(sensor_data)
-            
-            # No need to explicitly update plots here as they're handled
-            # by the plot manager and processing worker
-            
+
         except Exception as e:
             self.handle_error(f"Error handling new data: {str(e)}")
 

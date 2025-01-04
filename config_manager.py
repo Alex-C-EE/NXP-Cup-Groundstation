@@ -1,22 +1,27 @@
 # config_manager.py
 import json
 import os
-from pathlib import Path
 import base64
+import logging
+from pathlib import Path
 from typing import Any, Dict, Optional
+from datetime import datetime
 
 class ConfigManager:
     """
-    Handles application configuration settings for the race car ground station.
-    Provides secure storage for sensitive data and maintains default configurations
-    appropriate for racing telemetry visualization.
+    Enhanced configuration manager for race car ground station.
+    Provides secure storage, logging, and robust configuration management.
     """
     def __init__(self, config_dir: str = "~/.2space"):
-        self.config_dir = os.path.expanduser(config_dir)
-        self.config_file = os.path.join(self.config_dir, "config.json")
-        self.secrets_file = os.path.join(self.config_dir, ".secrets")
+        # Initialize logging
+        self.logger = logging.getLogger('race_ground_station.config')
         
-        # Default configuration
+        # Set up paths using pathlib for better cross-platform support
+        self.config_dir = Path(os.path.expanduser(config_dir))
+        self.config_file = self.config_dir / "config.json"
+        self.secrets_file = self.config_dir / ".secrets"
+        
+        # Default configuration - preserving your existing structure
         self.default_config = {
             "serial": {
                 "default_port": "/dev/ttyUSB0",
@@ -68,31 +73,39 @@ class ConfigManager:
         self._ensure_config_directory()
         self.config = self._load_config()
         self.secrets = self._load_secrets()
+        
+        self.logger.info("Configuration manager initialized successfully")
 
     def _ensure_config_directory(self) -> None:
         """Create configuration directory if it doesn't exist."""
-        os.makedirs(self.config_dir, exist_ok=True)
+        try:
+            self.config_dir.mkdir(parents=True, exist_ok=True)
+            self.logger.debug(f"Ensured config directory exists: {self.config_dir}")
+        except Exception as e:
+            self.logger.error(f"Error creating config directory: {e}")
+            raise
 
     def _load_config(self) -> Dict[str, Any]:
         """Load configuration from file or create with defaults if not exists."""
         try:
-            if os.path.exists(self.config_file):
+            if self.config_file.exists():
                 with open(self.config_file, 'r') as f:
                     loaded_config = json.load(f)
                     # Merge with defaults, keeping any additional user settings
                     merged_config = self.default_config.copy()
                     self._deep_update(merged_config, loaded_config)
+                    self.logger.debug("Loaded and merged existing configuration")
                     return merged_config
+                    
+            self.logger.info("No existing config found, using defaults")
             return self.default_config.copy()
+            
         except Exception as e:
-            print(f"Error loading config, using defaults: {e}")
+            self.logger.error(f"Error loading config, using defaults: {e}")
             return self.default_config.copy()
 
     def _deep_update(self, base: dict, update: dict) -> None:
-        """
-        Recursively update a nested dictionary while preserving existing keys.
-        This ensures new default settings are added without overwriting user customizations.
-        """
+        """Recursively update nested dictionary while preserving existing keys."""
         for key, value in update.items():
             if key in base and isinstance(base[key], dict) and isinstance(value, dict):
                 self._deep_update(base[key], value)
@@ -100,8 +113,9 @@ class ConfigManager:
                 base[key] = value
 
     def _load_secrets(self) -> Dict[str, str]:
-        """Load encrypted secrets from file with enhanced security."""
-        if not os.path.exists(self.secrets_file):
+        """Load encrypted secrets with enhanced security and logging."""
+        if not self.secrets_file.exists():
+            self.logger.debug("No secrets file found")
             return {}
             
         try:
@@ -109,24 +123,34 @@ class ConfigManager:
             current_mode = os.stat(self.secrets_file).st_mode
             if (current_mode & 0o777) != 0o600:
                 os.chmod(self.secrets_file, 0o600)
+                self.logger.warning("Fixed secrets file permissions")
                 
             with open(self.secrets_file, 'r') as f:
                 encoded_secrets = f.read().strip()
                 if encoded_secrets:
                     decoded = base64.b64decode(encoded_secrets)
+                    self.logger.debug("Successfully loaded secrets")
                     return json.loads(decoded.decode())
+                    
             return {}
+            
         except Exception as e:
-            print(f"Error loading secrets: {e}")
+            self.logger.error(f"Error loading secrets: {e}")
             return {}
 
     def save_config(self) -> None:
-        """Save current configuration to file with error handling."""
+        """Save configuration with backup and error handling."""
         try:
-            # Create a backup of the existing config file if it exists
-            if os.path.exists(self.config_file):
-                backup_file = f"{self.config_file}.backup"
-                os.replace(self.config_file, backup_file)
+            # Create backup directory if needed
+            backup_dir = self.config_dir / "backups"
+            backup_dir.mkdir(exist_ok=True)
+            
+            # Create timestamped backup if file exists
+            if self.config_file.exists():
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                backup_file = backup_dir / f"config_{timestamp}.json"
+                self.config_file.rename(backup_file)
+                self.logger.debug(f"Created backup: {backup_file}")
                 
             # Write new config file
             with open(self.config_file, 'w') as f:
@@ -135,57 +159,63 @@ class ConfigManager:
             # Set secure permissions
             os.chmod(self.config_file, 0o600)
             
+            self.logger.info("Configuration saved successfully")
+            
         except Exception as e:
-            print(f"Error saving config: {e}")
-            # If we have a backup and the save failed, restore it
-            if os.path.exists(f"{self.config_file}.backup"):
-                os.replace(f"{self.config_file}.backup", self.config_file)
+            self.logger.error(f"Error saving config: {e}")
+            # Attempt to restore from backup
+            latest_backup = sorted(backup_dir.glob("config_*.json"))[-1]
+            if latest_backup.exists():
+                latest_backup.rename(self.config_file)
+                self.logger.warning("Restored from latest backup")
 
     def save_secret(self, key: str, value: str) -> None:
-        """Save a secret value securely with enhanced encryption."""
+        """Save secret value with enhanced security and atomic operations."""
         self.secrets[key] = value
         try:
             encoded = base64.b64encode(json.dumps(self.secrets).encode())
             
-            # Write to temporary file first
-            temp_file = f"{self.secrets_file}.tmp"
+            # Use temporary file for atomic write
+            temp_file = self.secrets_file.with_suffix('.tmp')
             with open(temp_file, 'w') as f:
                 f.write(encoded.decode())
             os.chmod(temp_file, 0o600)
             
-            # Atomically replace the original file
-            os.replace(temp_file, self.secrets_file)
+            # Atomic replace
+            temp_file.replace(self.secrets_file)
+            self.logger.debug(f"Successfully saved secret: {key}")
             
         except Exception as e:
-            print(f"Error saving secret: {e}")
-            if os.path.exists(f"{self.secrets_file}.tmp"):
-                os.remove(f"{self.secrets_file}.tmp")
+            self.logger.error(f"Error saving secret: {e}")
+            if temp_file.exists():
+                temp_file.unlink()
 
     def get_secret(self, key: str) -> Optional[str]:
         """Retrieve a secret value."""
         return self.secrets.get(key)
 
     def get(self, section: str, key: str, default: Any = None) -> Any:
-        """Get a configuration value with optional default."""
+        """Get configuration value with logging."""
         try:
             return self.config[section][key]
         except KeyError:
+            self.logger.debug(f"Config value not found, using default: {section}.{key}")
             return default
 
     def set(self, section: str, key: str, value: Any) -> None:
-        """Set a configuration value, creating sections as needed."""
+        """Set configuration value with logging."""
         if section not in self.config:
             self.config[section] = {}
         self.config[section][key] = value
+        self.logger.debug(f"Set config value: {section}.{key}")
         
     def reset_to_defaults(self, section: Optional[str] = None) -> None:
-        """
-        Reset configuration to defaults, either entirely or for a specific section.
-        This is useful for troubleshooting or when settings become corrupted.
-        """
+        """Reset configuration to defaults with logging."""
         if section:
             if section in self.default_config:
                 self.config[section] = self.default_config[section].copy()
+                self.logger.info(f"Reset section to defaults: {section}")
         else:
             self.config = self.default_config.copy()
+            self.logger.info("Reset entire configuration to defaults")
         self.save_config()

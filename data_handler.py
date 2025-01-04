@@ -3,6 +3,7 @@ import os
 import csv
 import serial
 import numpy as np
+import logging
 from collections import deque
 from datetime import datetime
 from typing import Dict, Optional, Tuple, List
@@ -88,6 +89,81 @@ class SensorData:
     # System health
     system_health: SystemHealth
 
+class SerialThread(QThread):
+    """Dedicated thread for handling serial communication"""
+    data_received = pyqtSignal(str)
+    error_occurred = pyqtSignal(str)
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.serial_port = None
+        self.notifier = None
+        self.running = False
+        
+    def setup(self, port: str, baudrate: int, timeout: float):
+        """Store serial parameters for when the thread starts"""
+        self._port = port
+        self._baudrate = baudrate
+        self._timeout = timeout
+    
+    def run(self):
+        """Thread's main loop - creates serial port and notifier in the correct thread"""
+        try:
+            self.serial_port = serial.Serial(
+                port=self._port,
+                baudrate=self._baudrate,
+                timeout=self._timeout
+            )
+            
+            # Create notifier in this thread
+            self.notifier = QSocketNotifier(
+                self.serial_port.fileno(),
+                QSocketNotifier.Type.Read,
+                self
+            )
+            self.notifier.activated.connect(self._read_data)
+            self.notifier.setEnabled(True)
+            self.running = True
+            
+            # Enter event loop
+            self.exec_()
+            
+        except Exception as e:
+            self.error_occurred.emit(f"Serial setup error: {str(e)}")
+        finally:
+            self.cleanup()
+    
+    def _read_data(self):
+        """Slot to handle data reading when notifier is activated"""
+        if not self.running or not self.serial_port:
+            return
+            
+        try:
+            line = self.serial_port.readline().decode('ascii').strip()
+            if line:
+                self.data_received.emit(line)
+        except Exception as e:
+            self.error_occurred.emit(f"Data reading error: {str(e)}")
+    
+    def cleanup(self):
+        """Clean up resources"""
+        self.running = False
+        
+        if self.notifier:
+            self.notifier.setEnabled(False)
+            self.notifier.deleteLater()
+            self.notifier = None
+            
+        if self.serial_port and self.serial_port.is_open:
+            self.serial_port.close()
+            self.serial_port = None
+            
+    def stop(self):
+        """Stop the thread safely"""
+        self.running = False
+        self.quit()
+        self.wait()
+
 class DataHandler(QObject):
     """Handles real-time data collection and processing"""
     data_ready = pyqtSignal(object)
@@ -96,26 +172,46 @@ class DataHandler(QObject):
     playback_finished = pyqtSignal()
 
     def __init__(self, config_manager, data_queue, parent=None):
-            super().__init__(parent)
-            self.config = config_manager
-            self.data_queue = data_queue
-            self.running = False
-            self.playback_mode = False
-
-            # Initialize position tracking variables
-            self.last_timestamp = None
-            self.position_x = 0.0
-            self.position_y = 0.0
-            self.heading = 0.0
-
-            # Initialize data processing components
-            self._setup_processing_thread()
-
-            # Initialize other components
-            self.serial_port = None
-            self.notifier = None
-            self.buffer_size = self.config.get("display", "plot_buffer_size", 1000)
-            self._init_data_buffers()
+        """Initialize the data handler with proper logging setup"""
+        # First, call parent constructor
+        super().__init__(parent)
+        
+        # Create logger instance
+        self.logger = logging.getLogger('race_ground_station')
+        
+        # Store basic configuration
+        self.config = config_manager
+        self.data_queue = data_queue
+        
+        # Initialize state variables
+        self.running = False
+        self.playback_mode = False
+        self.last_timestamp = None
+        self.position_x = 0.0
+        self.position_y = 0.0
+        self.heading = 0.0
+        
+        self.logger.debug("Initializing DataHandler")
+        
+        # Set up configuration-dependent variables
+        self.buffer_size = self.config.get("display", "plot_buffer_size", 1000)
+        
+        # Initialize data buffers dictionary BEFORE calling _init_data_buffers
+        self.data_buffers = {}
+        
+        # Initialize components
+        self._init_data_buffers()
+        
+        self.logger.debug("Data buffers initialized")
+        
+        # Initialize serial handling
+        self.serial_thread = SerialThread()
+        self.serial_thread.data_received.connect(self._handle_serial_data)
+        self.serial_thread.error_occurred.connect(self.error_occurred)
+        
+        self._setup_processing_thread()
+        
+        self.logger.debug("DataHandler initialization complete")
 
     def _setup_processing_thread(self):
         """Set up the data processing thread and worker"""
@@ -138,13 +234,16 @@ class DataHandler(QObject):
         if self.playback_mode:
             self.stop_playback()
 
-        # Store configuration for later use in the main thread
-        self._port = port if port is not None else self.config.get("serial", "default_port")
-        self._baudrate = baudrate if baudrate is not None else self.config.get("serial", "baudrate")
+        # Get configuration
+        port = port if port is not None else self.config.get("serial", "default_port")
+        baudrate = baudrate if baudrate is not None else self.config.get("serial", "baudrate")
+        timeout = self.config.get("serial", "timeout", 1.0)  # Added default timeout
 
-        # Use QMetaObject to ensure serial setup happens in main thread
-        QMetaObject.invokeMethod(self, '_setup_serial',
-                               Qt.ConnectionType.QueuedConnection)
+        # Set up and start serial thread
+        self.serial_thread.setup(port, baudrate, timeout)
+        self.serial_thread.start()
+        self.running = True
+        self.connection_status.emit(True)
 
     @pyqtSlot()
     def _setup_serial(self):
@@ -176,27 +275,23 @@ class DataHandler(QObject):
             self.connection_status.emit(False)
 
     def stop(self):
-        """Stop data collection and clean up resources"""
-        self.running = False
-        
-        # Clean up notifier
-        if hasattr(self, 'notifier') and self.notifier:
-            self.notifier.setEnabled(False)
-            self.notifier.deleteLater()
-            self.notifier = None
+        """Stop data collection with state preservation"""
+        if not self.playback_mode:
+            # Normal stop for serial mode
+            self.running = False
+            if hasattr(self, 'serial_thread') and self.serial_thread:
+                self.serial_thread.stop()
+        else:
+            # Playback mode stop
+            if hasattr(self, 'playback_timer') and self.playback_timer:
+                self.playback_timer.stop()
+            self._reset_playback_state()
 
-        # Close serial port
-        if hasattr(self, 'serial_port') and self.serial_port:
-            if self.serial_port.is_open:
-                self.serial_port.close()
-            self.serial_port = None
-
-        # Stop processing thread
+        # Clean up processing thread
         if hasattr(self, 'processing_thread'):
             self.processing_thread.cleanup()
 
-        # Reset playback state
-        self.playback_mode = False
+        # Update status
         self.connection_status.emit(False)
 
     def _read_data(self):
@@ -217,93 +312,176 @@ class DataHandler(QObject):
         except Exception as e:
             self.error_occurred.emit(f"Data reading error: {str(e)}")
 
-    def _init_data_buffers(self):
-        """Initialize circular buffers for all telemetry data"""
-        self.data_buffers = {
-            'timestamp': deque(maxlen=self.buffer_size),
-            'speed': deque(maxlen=self.buffer_size),
-            'steering_angle': deque(maxlen=self.buffer_size),
-            'position_x': deque(maxlen=self.buffer_size),
-            'position_y': deque(maxlen=self.buffer_size),
-            'heading': deque(maxlen=self.buffer_size),
-            'centerline_error': deque(maxlen=self.buffer_size),
-            'track_confidence': deque(maxlen=self.buffer_size),
-            'battery_voltage': deque(maxlen=self.buffer_size),
-            'battery_current': deque(maxlen=self.buffer_size),
-            'battery_power': deque(maxlen=self.buffer_size)
-        }
-        
-        # Initialize 3D data buffers
-        for axis in ['x', 'y', 'z']:
-            self.data_buffers[f'accel_{axis}'] = deque(maxlen=self.buffer_size)
-            self.data_buffers[f'gyro_{axis}'] = deque(maxlen=self.buffer_size)
-
-    def start_playback(self, csv_file: str, speed: float = 1.0):
-        """Start data playback with proper thread handling"""
-        try:
-            self.stop()
-            
-            # Read playback data
-            self.playback_data = []
-            with open(csv_file, 'r') as f:
-                reader = csv.reader(f)
-                next(reader)  # Skip header
-                for line in reader:
-                    sensor_data = self._parse_data(','.join(line))
-                    if sensor_data:
-                        self.playback_data.append(sensor_data)
-
-            if not self.playback_data:
-                self.error_occurred.emit("No valid data found in CSV file")
-                return
-
-            # Initialize playback state
-            self.playback_mode = True
-            self.playback_speed = speed
-            self.playback_index = 0
-            self.running = True
-
-            # Start playback timer
-            self.playback_timer = QTimer(self)
-            self.playback_timer.timeout.connect(self._playback_tick)
-            interval = int(self.config.get("display", "update_interval_ms") / speed)
-            self.playback_timer.start(max(1, interval))
-
-            self.connection_status.emit(True)
-
-        except Exception as e:
-            self.error_occurred.emit(f"Playback error: {str(e)}")
-            self.connection_status.emit(False)
-
-    def _playback_tick(self):
-        """Handle playback updates with thread safety"""
-        if not self.running or self.playback_index >= len(self.playback_data):
-            self.playback_timer.stop()
-            self.playback_finished.emit()
+    def _handle_serial_data(self, line: str):
+        """Handle incoming serial data in a thread-safe way"""
+        if not self.running or self.playback_mode:
             return
 
         try:
-            # Get current data point
+            sensor_data = self._parse_data(line)
+            if sensor_data:
+                # Update buffers in main thread
+                self._update_buffers(sensor_data)
+                # Process data in worker thread
+                self.processing_worker.process_data(sensor_data)
+        except Exception as e:
+            self.error_occurred.emit(f"Data handling error: {str(e)}")
+
+    def _init_data_buffers(self):
+        """Initialize circular buffers for all telemetry data"""
+        # Verify buffer_size is set and valid
+        if not hasattr(self, 'buffer_size') or self.buffer_size <= 0:
+            self.buffer_size = 1000  # Fallback default
+            self.logger.warning("Buffer size not set or invalid, using default: 1000")
+
+        try:
+            # Now initialize all buffers
+            buffer_specs = {
+                'timestamp': float,
+                'speed': float,
+                'steering_angle': float,
+                'position_x': float,
+                'position_y': float,
+                'heading': float,
+                'centerline_error': float,
+                'track_confidence': float,
+                'battery_voltage': float,
+                'battery_current': float,
+                'battery_power': float
+            }
+
+            # Create each buffer with proper size
+            for name, dtype in buffer_specs.items():
+                self.data_buffers[name] = deque(maxlen=self.buffer_size)
+
+            # Initialize IMU data buffers
+            for axis in ['x', 'y', 'z']:
+                self.data_buffers[f'accel_{axis}'] = deque(maxlen=self.buffer_size)
+                self.data_buffers[f'gyro_{axis}'] = deque(maxlen=self.buffer_size)
+
+            self.logger.debug(f"Initialized {len(self.data_buffers)} data buffers with size {self.buffer_size}")
+
+        except Exception as e:
+            self.logger.error(f"Error initializing data buffers: {str(e)}")
+            raise  # Re-raise the exception to be handled by caller
+
+    
+    def _reset_playback_state(self):
+        """Reset playback-related state variables"""
+        self.playback_mode = False
+        self.running = False
+        self.playback_data = []
+        self.playback_index = 0
+        if hasattr(self, 'playback_timer') and self.playback_timer:
+            self.playback_timer.stop()
+    
+    def start_playback(self, csv_file: str, speed: float = 1.0):
+        """Start data playback with robust state management"""
+        try:
+            # IMPORTANT: Don't call stop() here as it resets playback state
+            # Just stop serial thread if running
+            if hasattr(self, 'serial_thread') and self.serial_thread:
+                self.serial_thread.stop()
+                self.connection_status.emit(False)
+
+            if not os.path.exists(csv_file):
+                self.error_occurred.emit(f"Playback file not found: {csv_file}")
+                return
+
+            # Load and verify data
+            self.playback_data = []
+            line_count = 0
+            valid_data_count = 0
+
+            with open(csv_file, 'r') as f:
+                reader = csv.reader(f)
+                header = next(reader)  # Skip header
+
+                for line in reader:
+                    line_count += 1
+                    sensor_data = self._parse_data(','.join(line))
+                    if sensor_data:
+                        self.playback_data.append(sensor_data)
+                        valid_data_count += 1
+
+            if not self.playback_data:
+                self.error_occurred.emit("No valid data points found in CSV file")
+                return
+
+            # Set up playback state
+            self.playback_mode = True
+            self.running = True
+            self.playback_speed = speed
+            self.playback_index = 0
+
+            # Set up and start timer
+            interval = max(1, int(self.config.get("display", "update_interval_ms") / speed))
+            self.playback_timer = QTimer(self)
+            self.playback_timer.timeout.connect(self._playback_tick)
+            self.playback_timer.start(interval)
+
+            # Emit status updates
+            self.connection_status.emit(True)
+            self.error_occurred.emit(f"Playback started: {valid_data_count} data points loaded")
+
+        except Exception as e:
+            self.error_occurred.emit(f"Failed to start playback: {str(e)}")
+            self._reset_playback_state()
+            self.connection_status.emit(False)
+
+
+    def _playback_tick(self):
+        """Handle playback tick with state verification"""
+        if not self.running or not self.playback_mode:
+            self.logger.warning("Playback tick called but playback is not active")
+            if hasattr(self, 'playback_timer') and self.playback_timer:
+                self.playback_timer.stop()
+            return
+
+        try:
+            if self.playback_index >= len(self.playback_data):
+                self.logger.info("Playback complete")
+                self.playback_timer.stop()
+                self._reset_playback_state()
+                self.playback_finished.emit()
+                return
+
+            # Process current data point
             sensor_data = self.playback_data[self.playback_index]
-            
-            # Update buffers in main thread
+
+            # Log periodic progress
+            if self.playback_index % 100 == 0:
+                self.logger.debug(f"Processing data point {self.playback_index}/{len(self.playback_data)}")
+                self.logger.debug(f"Data: Speed={sensor_data.speed:.2f}, Pos=({sensor_data.position_x:.2f}, {sensor_data.position_y:.2f})")
+
+            # Update data
             self._update_buffers(sensor_data)
-            
-            # Process data in worker thread using correct method name
             self.processing_worker.process_data(sensor_data)
-            
+            self.data_ready.emit(sensor_data)
+
             self.playback_index += 1
 
         except Exception as e:
-            self.error_occurred.emit(f"Playback processing error: {str(e)}")
+            self.logger.error(f"Error in playback tick: {str(e)}")
+            self.error_occurred.emit(f"Playback error: {str(e)}")
+            self._reset_playback_state()
+
 
     def stop_playback(self):
-        """Stop playback and cleanup"""
+        """Stop playback with verification"""
+        self.logger.info("Stopping playback")
         if hasattr(self, 'playback_timer') and self.playback_timer:
             self.playback_timer.stop()
+            if self.playback_timer.isActive():
+                self.logger.warning("Timer failed to stop")
+            else:
+                self.logger.debug("Timer stopped successfully")
+
         self.playback_mode = False
         self.playback_data = []
         self.playback_index = 0
+        self.running = False
+        self.logger.debug("Playback cleanup complete")
 
     def _setup_notifier(self):
         """Create the QSocketNotifier in the correct thread"""
@@ -463,24 +641,32 @@ class DataHandler(QObject):
             return None
 
     def _update_buffers(self, data: SensorData):
-        """Update circular buffers with new data"""
-        # Update simple numeric buffers
-        self.data_buffers['timestamp'].append(data.timestamp)
-        self.data_buffers['speed'].append(data.speed)
-        self.data_buffers['steering_angle'].append(data.steering_angle)
-        self.data_buffers['position_x'].append(data.position_x)
-        self.data_buffers['position_y'].append(data.position_y)
-        self.data_buffers['heading'].append(data.heading)
-        self.data_buffers['centerline_error'].append(data.centerline_error)
-        self.data_buffers['track_confidence'].append(data.track_confidence)
-        self.data_buffers['battery_voltage'].append(data.battery_voltage)
-        self.data_buffers['battery_current'].append(data.battery_current)
-        self.data_buffers['battery_power'].append(data.battery_power)
-        
-        # Update IMU data buffers
-        for i, axis in enumerate(['x', 'y', 'z']):
-            self.data_buffers[f'accel_{axis}'].append(data.acceleration[i])
-            self.data_buffers[f'gyro_{axis}'].append(data.gyroscope[i])
+        """Update circular buffers with new data and verify updates"""
+        try:
+            # Update simple numeric buffers
+            self.data_buffers['timestamp'].append(data.timestamp)
+            self.data_buffers['speed'].append(data.speed)
+            self.data_buffers['steering_angle'].append(data.steering_angle)
+            self.data_buffers['position_x'].append(data.position_x)
+            self.data_buffers['position_y'].append(data.position_y)
+            self.data_buffers['heading'].append(data.heading)
+            self.data_buffers['centerline_error'].append(data.centerline_error)
+            self.data_buffers['track_confidence'].append(data.track_confidence)
+            self.data_buffers['battery_voltage'].append(data.battery_voltage)
+            self.data_buffers['battery_current'].append(data.battery_current)
+            self.data_buffers['battery_power'].append(data.battery_power)
+
+            # Update IMU data buffers
+            for i, axis in enumerate(['x', 'y', 'z']):
+                self.data_buffers[f'accel_{axis}'].append(data.acceleration[i])
+                self.data_buffers[f'gyro_{axis}'].append(data.gyroscope[i])
+
+            if len(self.data_buffers['timestamp']) % 100 == 0:
+                self.logger.debug(f"Buffer update complete. Current sizes: {[len(buf) for buf in self.data_buffers.values()]}")
+
+        except Exception as e:
+            self.logger.error(f"Error updating buffers: {str(e)}", exc_info=True)
+            raise
 
     def get_buffer_data(self, field: str) -> Tuple[np.ndarray, np.ndarray]:
         """Get timestamps and values for a specific field"""
